@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -9,11 +10,13 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/cilium/ebpf/link"
 )
 
-var syscallNames = map[uint32]string{
+var defaultSyscallNames = map[uint32]string{
 	0:   "read",
 	1:   "write",
 	2:   "open",
@@ -26,6 +29,8 @@ var syscallNames = map[uint32]string{
 	257: "openat",
 	262: "newfstatat",
 }
+
+var configuredSyscallNames map[uint32]string
 
 type record struct {
 	ID      uint32
@@ -45,11 +50,72 @@ type outputRecord struct {
 }
 
 func syscallName(id uint32) string {
-	name := syscallNames[id]
+	name := configuredSyscallNames[id]
+	if name == "" {
+		name = defaultSyscallNames[id]
+	}
 	if name == "" {
 		return fmt.Sprintf("sys_%d", id)
 	}
 	return name
+}
+
+func loadSyscallNames(path string) (map[uint32]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	names := make(map[uint32]string)
+	scanner := bufio.NewScanner(file)
+	lineNo := 0
+
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		idText, name, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("%s:%d: expected id=name", path, lineNo)
+		}
+
+		id, err := strconv.ParseUint(strings.TrimSpace(idText), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("%s:%d: parse syscall id: %w", path, lineNo, err)
+		}
+
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, fmt.Errorf("%s:%d: syscall name is empty", path, lineNo)
+		}
+
+		names[uint32(id)] = name
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return names, nil
+}
+
+func filterRecords(records []record) []record {
+	if configuredSyscallNames == nil {
+		return records
+	}
+
+	filtered := make([]record, 0, len(records))
+	for _, r := range records {
+		if _, ok := configuredSyscallNames[r.ID]; ok {
+			filtered = append(filtered, r)
+		}
+	}
+
+	return filtered
 }
 
 func toOutputRecords(records []record) []outputRecord {
@@ -127,7 +193,20 @@ func printJSON(records []record) {
 
 func main() {
 	outputFormat := flag.String("output", "text", "output format: text, csv, or json")
+	syscallConfigPath := flag.String("syscalls", "", "optional path to syscall config file (id=name)")
 	flag.Parse()
+
+	configPath := *syscallConfigPath
+	if configPath == "" {
+		configPath = os.Getenv("SYSCALL_CONFIG")
+	}
+	if configPath != "" {
+		configured, err := loadSyscallNames(configPath)
+		if err != nil {
+			log.Fatalf("load syscall config: %v", err)
+		}
+		configuredSyscallNames = configured
+	}
 
 	objs := syscallObjects{}
 	if err := loadSyscallObjects(&objs, nil); err != nil {
@@ -174,6 +253,8 @@ func main() {
 	if err := iter.Err(); err != nil {
 		log.Fatalf("map iteration: %v", err)
 	}
+
+	records = filterRecords(records)
 
 	sort.Slice(records, func(i, j int) bool {
 		if records[i].ID == records[j].ID {
